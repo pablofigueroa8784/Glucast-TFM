@@ -34,12 +34,12 @@ Si faltan lecturas (se necesitan 2 h continuas de CGM) responde `422` con un men
 
 ## Archivos del modelo
 
-Copiar a `modelo/` los archivos generados por el notebook (están en Drive, `TFM/GRAFICOS/EVAL 2DO MODELO`):
+`modelo/` contiene los archivos generados por el notebook de ajuste fino (copia de Drive, `TFM/GRAFICOS/EVAL 2DO MODELO`):
 
 - `glucast_modelo_finetune.keras`
 - `glucast_finetune_scaler.pkl`
 
-No se suben al repositorio (ver `.gitignore`).
+Si se re-entrena el modelo, reemplazar ambos archivos juntos.
 
 ## Uso local
 
