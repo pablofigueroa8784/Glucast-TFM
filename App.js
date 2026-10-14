@@ -8,6 +8,7 @@ import {
 import { GestureHandlerRootView, GestureDetector, Gesture } from 'react-native-gesture-handler';
 import Svg, { Path, Line, Text as SvgText } from 'react-native-svg';
 import * as ImagePicker from 'expo-image-picker';
+import * as ImageManipulator from 'expo-image-manipulator';
 
 // Configuración privada: copiar config.example.js como config.js y completar los valores.
 // config.js está excluido del repositorio (.gitignore).
@@ -63,6 +64,8 @@ function AppInterno() {
   const [mostrarResultadoComida, setMostrarResultadoComida] = useState(false);
   const [fotoUri, setFotoUri] = useState(null);
   const [nombrePlato, setNombrePlato] = useState('');
+  const [nombreCorreccion, setNombreCorreccion] = useState('');
+  const ultimaImagenRef = useRef(null); // base64 reducido de la última foto, para reanalizar sin volver a sacarla
 
   // Tendencia manual de glucosa
   const [tendenciaManual, setTendenciaManual] = useState('→');
@@ -287,8 +290,7 @@ function AppInterno() {
       }
       result = await ImagePicker.launchCameraAsync({
         mediaTypes: ImagePicker.MediaTypeOptions.Images,
-        quality: 0.6,
-        base64: true,
+        quality: 1,
       });
     } else {
       const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
@@ -298,13 +300,33 @@ function AppInterno() {
       }
       result = await ImagePicker.launchImageLibraryAsync({
         mediaTypes: ImagePicker.MediaTypeOptions.Images,
-        quality: 0.6,
-        base64: true,
+        quality: 1,
       });
     }
     if (result.canceled) return;
     const asset = result.assets[0];
     setFotoUri(asset.uri);
+    setEscaneando(true);
+    try {
+      // Reducir a 1024 px de ancho: la foto original de la cámara pesa varios MB en
+      // base64 y provocaba timeouts; Vision no necesita más resolución para reconocer el plato.
+      const reducida = await ImageManipulator.manipulateAsync(
+        asset.uri,
+        asset.width > 1024 ? [{ resize: { width: 1024 } }] : [],
+        { compress: 0.7, format: ImageManipulator.SaveFormat.JPEG, base64: true }
+      );
+      ultimaImagenRef.current = reducida.base64;
+    } catch (e) {
+      setEscaneando(false);
+      Alert.alert('Error', `No se pudo procesar la foto: ${e.message}`);
+      return;
+    }
+    await analizarImagen(nombrePlato);
+  };
+
+  // Envía la última foto al vision-server. Se usa al escanear y al corregir el nombre del plato.
+  const analizarImagen = async (nombre) => {
+    if (!ultimaImagenRef.current) return;
     setEscaneando(true);
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 60000);
@@ -312,27 +334,41 @@ function AppInterno() {
       const res = await fetch(`${VISION_SERVER_URL}/analizar`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ imagen: asset.base64, ic_ratio: config.icRatio, nombre_plato: nombrePlato }),
+        body: JSON.stringify({ imagen: ultimaImagenRef.current, ic_ratio: config.icRatio, nombre_plato: nombre || '' }),
         signal: controller.signal,
       });
       clearTimeout(timeout);
       const data = await res.json();
       if (data.error && !data.porciones) {
-        Alert.alert('No se pudo identificar', data.error || 'Intentá con otra foto más clara.');
+        const detectado = (data.labels || []).slice(0, 4).map(l => l.nombre).join(', ');
+        Alert.alert(
+          'No se pudo calcular',
+          (data.sugerencia || data.error || 'Intentá con otra foto más clara.') + (detectado ? `\n\nDetectado: ${detectado}` : '')
+        );
       } else {
         setResultadoEscaneo(data);
+        setNombreCorreccion('');
         setMostrarResultadoComida(true);
       }
     } catch (e) {
       clearTimeout(timeout);
       if (e.name === 'AbortError') {
-        Alert.alert('Tiempo agotado', 'El servidor tardó demasiado. Intentá con una foto más pequeña.');
+        Alert.alert('Tiempo agotado', 'El servidor tardó demasiado. Intentá de nuevo.');
       } else {
         Alert.alert('Error', `No se pudo conectar: ${e.message}`);
       }
     } finally {
       setEscaneando(false);
     }
+  };
+
+  const cerrarResultadoComida = () => {
+    setMostrarResultadoComida(false);
+    setResultadoEscaneo(null);
+    setFotoUri(null);
+    setNombrePlato('');
+    setNombreCorreccion('');
+    ultimaImagenRef.current = null;
   };
 
   const aplicarPorcion = (tamano) => {
@@ -342,10 +378,7 @@ function AppInterno() {
     setCarbohidratos(String(carbs));
     const insulinaTotal = calcularInsulinaTotal(glucosa, reajusteCarbs || String(carbs), tendenciaManual, iob);
     setInsulina(insulinaTotal);
-    setMostrarResultadoComida(false);
-    setResultadoEscaneo(null);
-    setFotoUri(null);
-    setNombrePlato('');
+    cerrarResultadoComida();
   };
 
   const seleccionarDia = (dia) => { setFechaSeleccionada(new Date(selectorAnio, selectorMes, dia)); setMostrarSelectorFecha(false); };
@@ -955,8 +988,32 @@ function AppInterno() {
             {resultadoEscaneo && (
               <>
                 <Text style={styles.alimentoDetectado}>
-                  {resultadoEscaneo.nombre_manual || resultadoEscaneo.alimento_detectado}
+                  {resultadoEscaneo.alimento_detectado}
+                  {resultadoEscaneo.carbs_por_100g != null ? ` · ${resultadoEscaneo.carbs_por_100g}g carbs/100g` : ''}
                 </Text>
+                {resultadoEscaneo.candidatos && resultadoEscaneo.candidatos.length > 1 && (
+                  <>
+                    <Text style={styles.candidatosHint}>¿No es esto? Tocá la opción correcta:</Text>
+                    <View style={styles.candidatosContainer}>
+                      {resultadoEscaneo.candidatos.slice(1).map(c => (
+                        <TouchableOpacity key={c.nombre} style={styles.candidatoChip} disabled={escaneando} onPress={() => analizarImagen(c.nombre)}>
+                          <Text style={styles.candidatoChipTexto}>{c.nombre}</Text>
+                        </TouchableOpacity>
+                      ))}
+                    </View>
+                  </>
+                )}
+                <View style={styles.correccionNombreFila}>
+                  <TextInput
+                    style={[styles.input, { flex: 1, marginBottom: 0 }]}
+                    value={nombreCorreccion}
+                    onChangeText={setNombreCorreccion}
+                    placeholder="Escribí el plato correcto..."
+                  />
+                  <TouchableOpacity style={styles.botonRecalcular} disabled={escaneando || !nombreCorreccion.trim()} onPress={() => analizarImagen(nombreCorreccion.trim())}>
+                    {escaneando ? <ActivityIndicator size="small" color="#fff" /> : <Text style={styles.botonEscanearTexto}>Recalcular</Text>}
+                  </TouchableOpacity>
+                </View>
                 <Text style={styles.porcionHint}>Seleccioná el tamaño de tu porción:</Text>
                 {!isNaN(parseFloat(glucosa)) && (parseFloat(glucosa) > config.umbralCorreccion || parseFloat(glucosa) < config.glucosaMin) && (
                   <Text style={[styles.correccionAviso, { color: parseFloat(glucosa) > config.umbralCorreccion ? '#fb8c00' : '#1a73e8' }]}>
@@ -975,14 +1032,14 @@ function AppInterno() {
                         <Text style={styles.porcionTam}>{labels[tam]}</Text>
                         <Text style={styles.porcionPeso}>{p.peso_g}g</Text>
                         <Text style={styles.porcionCarbs}>{p.carbs_totales}g carbs</Text>
-                        <Text style={styles.porcionInsulina}>💉 {p.insulina_u} U</Text>
+                        <Text style={styles.porcionInsulina}>💉 {calcularInsulinaTotal(glucosa, String(p.carbs_totales), tendenciaManual, iob)} U</Text>
                       </TouchableOpacity>
                     );
                   })}
                 </View>
               </>
             )}
-            <TouchableOpacity style={styles.modalCerrar} onPress={() => { setMostrarResultadoComida(false); setResultadoEscaneo(null); setFotoUri(null); setNombrePlato(''); }}>
+            <TouchableOpacity style={styles.modalCerrar} onPress={cerrarResultadoComida}>
               <Text style={styles.modalCerrarTexto}>Cancelar — ingresar manualmente</Text>
             </TouchableOpacity>
           </View>
@@ -1086,6 +1143,12 @@ const styles = StyleSheet.create({
   fotoComida: { width: '100%', height: 180, borderRadius: 12, marginBottom: 12 },
   alimentoDetectado: { fontSize: 15, fontWeight: '600', color: '#333', textAlign: 'center', marginBottom: 8 },
   porcionHint: { fontSize: 13, color: '#888', textAlign: 'center', marginBottom: 16 },
+  candidatosHint: { fontSize: 12, color: '#888', textAlign: 'center', marginBottom: 6 },
+  candidatosContainer: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'center', gap: 6, marginBottom: 10 },
+  candidatoChip: { backgroundColor: '#e8f0fe', borderRadius: 16, paddingHorizontal: 12, paddingVertical: 6 },
+  candidatoChipTexto: { fontSize: 13, color: '#1a73e8', fontWeight: '600' },
+  correccionNombreFila: { flexDirection: 'row', alignItems: 'center', gap: 6, marginBottom: 12 },
+  botonRecalcular: { backgroundColor: '#1a73e8', borderRadius: 10, paddingHorizontal: 12, paddingVertical: 12, justifyContent: 'center' },
   porcionesContainer: { flexDirection: 'row', gap: 10, justifyContent: 'center', marginBottom: 8 },
   porcionBtn: { flex: 1, backgroundColor: '#f5f5f5', borderRadius: 12, padding: 14, alignItems: 'center', borderWidth: 2, borderColor: '#e0e0e0' },
   porcionTam: { fontSize: 16, fontWeight: 'bold', color: '#1a73e8', marginBottom: 4 },
