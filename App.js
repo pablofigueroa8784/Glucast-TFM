@@ -6,12 +6,12 @@ import {
   KeyboardAvoidingView, Platform, FlatList, ActivityIndicator, Dimensions, Modal, Image
 } from 'react-native';
 import { GestureHandlerRootView, GestureDetector, Gesture } from 'react-native-gesture-handler';
-import Svg, { Path, Line, Text as SvgText } from 'react-native-svg';
+import Svg, { Path, Line, Circle, Text as SvgText } from 'react-native-svg';
 import * as ImagePicker from 'expo-image-picker';
 
 // Configuración privada: copiar config.example.js como config.js y completar los valores.
 // config.js está excluido del repositorio (.gitignore).
-import { NIGHTSCOUT_URL, NIGHTSCOUT_TOKEN, VISION_SERVER_URL } from './config';
+import { NIGHTSCOUT_URL, NIGHTSCOUT_TOKEN, VISION_SERVER_URL, PREDICTION_SERVER_URL } from './config';
 const SCREEN_WIDTH = Dimensions.get('window').width - 40;
 const RANGOS_ZOOM = [1, 2, 3, 6, 12, 24, 48];
 
@@ -56,6 +56,8 @@ function AppInterno() {
   const [datosGarmin, setDatosGarmin] = useState(null);
   const [cargandoGarmin, setCargandoGarmin] = useState(false);
   const [bolos, setBolos] = useState([]);
+  const [prediccion, setPrediccion] = useState(null);
+  const [errorPrediccion, setErrorPrediccion] = useState(null);
 
   // Escáner de comida
   const [escaneando, setEscaneando] = useState(false);
@@ -185,7 +187,11 @@ function AppInterno() {
       fetchDatosGarmin(fechaBase);
       fetchBolos(fechaBase);
       if (fechaSeleccionada) { fetchHistorialFecha(fechaSeleccionada); }
-      else { fetchHistorial(); const intervalo = setInterval(fetchGlucosaActual, 60000); return () => clearInterval(intervalo); }
+      else {
+        fetchHistorial(); fetchPrediccion();
+        const intervalo = setInterval(() => { fetchGlucosaActual(); fetchPrediccion(); }, 60000);
+        return () => clearInterval(intervalo);
+      }
     }
   }, [pantalla, fechaSeleccionada]);
 
@@ -203,6 +209,17 @@ function AppInterno() {
         setGlucosa(prev => (prev === '' ? String(entrada.sgv) : prev));
       }
     } catch (e) {}
+  }, []);
+
+  // Predicción LSTM a 30 min (servidor de predicción, ver prediction-server/)
+  const fetchPrediccion = useCallback(async () => {
+    if (!PREDICTION_SERVER_URL) return;
+    try {
+      const res = await fetch(`${PREDICTION_SERVER_URL}/predecir`);
+      const data = await res.json();
+      if (!res.ok) { setPrediccion(null); setErrorPrediccion(data.error || 'Sin predicción'); return; }
+      setPrediccion(data); setErrorPrediccion(null);
+    } catch (e) { setErrorPrediccion('Servidor de predicción no disponible'); }
   }, []);
 
   const fetchHistorial = useCallback(async () => {
@@ -443,6 +460,11 @@ function AppInterno() {
       ? new Date(fechaSeleccionada).setHours(23, 59, 59, 999) - offsetHoras * 3600000
       : ahoraMs - offsetHoras * 3600000;
     const inicioVentana = finVentana - rangoSeleccionado * 3600000;
+    // La predicción se dibuja en tiempo real si su lectura base está en la ventana;
+    // el eje X se extiende hasta el punto predicho (+30 min).
+    const enVivo = !fechaSeleccionada && offsetHoras === 0;
+    const prediccionVisible = enVivo && prediccion && prediccion.timestamp_base >= inicioVentana && prediccion.timestamp_base <= finVentana;
+    const finGrafico = prediccionVisible ? Math.max(finVentana, prediccion.timestamp_prediccion) : finVentana;
     const historialFiltrado = historial.filter(e => e.date >= inicioVentana && e.date <= finVentana);
     const tituloFecha = fechaSeleccionada
       ? fechaSeleccionada.toLocaleDateString('es-AR', { weekday: 'short', day: '2-digit', month: 'short', year: 'numeric' })
@@ -488,6 +510,24 @@ function AppInterno() {
             <Text style={styles.tiempoRT}>{minutosDesde(ultimaActualizacion)}</Text>
           </View>
         )}
+        {enVivo && PREDICTION_SERVER_URL && (prediccion || errorPrediccion) && (
+          <View style={styles.cardPrediccion}>
+            {prediccion ? (
+              <>
+                <Text style={styles.prediccionTitulo}>🔮 Predicción LSTM a {prediccion.horizonte_min} min</Text>
+                <Text style={[styles.prediccionValor, { color: colorGlucosa(prediccion.prediccion_mgdl) }]}>{prediccion.prediccion_mgdl} <Text style={styles.prediccionUnidad}>mg/dL</Text></Text>
+                <Text style={styles.prediccionDetalle}>
+                  a las {new Date(prediccion.timestamp_prediccion).toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit' })} · desde {prediccion.glucosa_base} mg/dL de las {new Date(prediccion.timestamp_base).toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit' })}
+                </Text>
+                {prediccion.minutos_desde_ultima_lectura > 15 && (
+                  <Text style={styles.prediccionAviso}>⚠ Basada en una lectura de {prediccion.minutos_desde_ultima_lectura < 120 ? `hace ${prediccion.minutos_desde_ultima_lectura} min` : prediccion.minutos_desde_ultima_lectura < 2880 ? `hace ${Math.round(prediccion.minutos_desde_ultima_lectura / 60)} h` : `hace ${Math.round(prediccion.minutos_desde_ultima_lectura / 1440)} días`}</Text>
+                )}
+              </>
+            ) : (
+              <Text style={styles.prediccionDetalle}>🔮 {errorPrediccion}</Text>
+            )}
+          </View>
+        )}
         {valores.length > 0 && (
           <View style={styles.statsContainer}>
             <View style={styles.statItem}><Text style={styles.statLabel}>Promedio</Text><Text style={[styles.statValor, { color: colorGlucosa(promedio) }]}>{promedio}</Text></View>
@@ -525,19 +565,20 @@ function AppInterno() {
             <View style={styles.graficoContainer}>
               {(() => {
                 const margen = 20;
-                const yMin = Math.max(40, (minVal || 70) - margen);
-                const yMax = Math.min(400, (maxVal || 180) + margen);
+                const valPred = prediccionVisible ? prediccion.prediccion_mgdl : null;
+                const yMin = Math.max(40, Math.min(minVal || 70, valPred ?? Infinity) - margen);
+                const yMax = Math.min(400, Math.max(maxVal || 180, valPred ?? -Infinity) + margen);
                 const yRango = yMax - yMin;
                 const W = SCREEN_WIDTH - 32;
                 const H = 130;
-                const px = (ts) => ((ts - inicioVentana) / (finVentana - inicioVentana)) * W;
+                const px = (ts) => ((ts - inicioVentana) / (finGrafico - inicioVentana)) * W;
                 const py = (val) => H - ((val - yMin) / yRango) * H;
                 const segmentos = [];
                 for (let i = 0; i < historialFiltrado.length - 1; i++) {
                   const a = historialFiltrado[i]; const b = historialFiltrado[i + 1];
                   segmentos.push(<Path key={`seg-${i}`} d={`M${px(a.date)},${py(a.sgv)} L${px(b.date)},${py(b.sgv)}`} stroke={colorGlucosa(a.sgv)} strokeWidth={2.5} strokeLinecap="round" />);
                 }
-                const duracionMs = finVentana - inicioVentana;
+                const duracionMs = finGrafico - inicioVentana;
                 const duracionHoras = duracionMs / 3600000;
                 let intervaloMin;
                 if (duracionHoras <= 1) intervaloMin = 10;
@@ -549,7 +590,7 @@ function AppInterno() {
                 const intervaloMs = intervaloMin * 60000;
                 const primerTick = Math.ceil(inicioVentana / intervaloMs) * intervaloMs;
                 const ticksSvg = [];
-                for (let t = primerTick; t <= finVentana; t += intervaloMs) {
+                for (let t = primerTick; t <= finGrafico; t += intervaloMs) {
                   const pct = (t - inicioVentana) / duracionMs;
                   if (pct < 0 || pct > 1) continue;
                   const x = pct * W;
@@ -566,6 +607,12 @@ function AppInterno() {
                     <SvgText x={2} y={10} fontSize={9} fill="#bbb">{Math.round(yMax)}</SvgText>
                     <SvgText x={2} y={H - 2} fontSize={9} fill="#bbb">{Math.round(yMin)}</SvgText>
                     {segmentos}
+                    {prediccionVisible && (
+                      <>
+                        <Path d={`M${px(prediccion.timestamp_base)},${py(prediccion.glucosa_base)} L${px(prediccion.timestamp_prediccion)},${py(prediccion.prediccion_mgdl)}`} stroke="#7e57c2" strokeWidth={2} strokeDasharray="5,4" />
+                        <Circle cx={px(prediccion.timestamp_prediccion)} cy={py(prediccion.prediccion_mgdl)} r={4} fill="#7e57c2" />
+                      </>
+                    )}
                     {bolosFiltrados.map((b, i) => (<SvgText key={`bolo-${i}`} x={px(b.timestamp)} y={H - 4} fontSize={12} textAnchor="middle">💉</SvgText>))}
                     {ticksSvg}
                   </Svg>
@@ -1034,6 +1081,12 @@ const styles = StyleSheet.create({
   unidadRT: { fontSize: 16, color: '#888', marginTop: 4 },
   estadoRT: { fontSize: 15, fontWeight: '600', marginTop: 8 },
   tiempoRT: { fontSize: 12, color: '#aaa', marginTop: 4 },
+  cardPrediccion: { backgroundColor: '#f3effa', borderRadius: 12, padding: 14, alignItems: 'center', marginBottom: 16 },
+  prediccionTitulo: { fontSize: 13, color: '#5e35b1', fontWeight: '600' },
+  prediccionValor: { fontSize: 32, fontWeight: 'bold', marginTop: 4 },
+  prediccionUnidad: { fontSize: 14, color: '#888', fontWeight: 'normal' },
+  prediccionDetalle: { fontSize: 12, color: '#777', marginTop: 4, textAlign: 'center' },
+  prediccionAviso: { fontSize: 12, color: '#fb8c00', marginTop: 4 },
   graficoContainer: { backgroundColor: '#fff', borderRadius: 12, marginBottom: 12, overflow: 'hidden', padding: 8 },
   filaHistorial: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', backgroundColor: '#fff', borderRadius: 8, padding: 12, marginBottom: 6 },
   filaHora: { fontSize: 13, color: '#888', flex: 1 },
