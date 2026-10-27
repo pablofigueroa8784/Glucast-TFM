@@ -1,0 +1,98 @@
+{
+  "version": "2026-10-27 15:39",
+  "origen": "resultados_20261020_1649",
+  "horizonte_min": 30,
+  "ventana": 24,
+  "features": [
+    "glucosa",
+    "tendencia",
+    "bolo_u",
+    "iob",
+    "carbs",
+    "cob",
+    "hora_sin",
+    "hora_cos"
+  ],
+  "escalas": {
+    "glucosa": 400,
+    "tendencia": 50,
+    "bolo_u": 10,
+    "iob": 10,
+    "carbs": 100,
+    "cob": 100,
+    "hora_sin": 1,
+    "hora_cos": 1
+  },
+  "escala_delta": 100,
+  "dia_periodos": 24,
+  "absorcion_carbs": 36,
+  "zona_horaria": "America/Argentina/Buenos_Aires",
+  "capas": [
+    {
+      "tipo": "lstm",
+      "id": 0,
+      "unidades": 64,
+      "secuencias": true
+    },
+    {
+      "tipo": "bn",
+      "id": 1,
+      "eps": 0.001
+    },
+    {
+      "tipo": "lstm",
+      "id": 3,
+      "unidades": 32,
+      "secuencias": false
+    },
+    {
+      "tipo": "bn",
+      "id": 4,
+      "eps": 0.001
+    },
+    {
+      "tipo": "dense",
+      "id": 6,
+      "activacion": "relu"
+    },
+    {
+      "tipo": "dense",
+      "id": 7,
+      "activacion": "linear"
+    }
+  ],
+  "cuantiles_conformal": {
+    "inferior_a020": -10.105064288961518,
+    "inferior_a010": -16.298881133785216,
+    "superior_a020": 9.916790875978739,
+    "superior_a010": 18.582320013666237
+  },
+  "n_validacion": 6353,
+  "alarmas": {
+    "hipo": {
+      "regla": "limite_inferior",
+      "alfa": 0.2,
+      "cuantil": "inferior_a020",
+      "umbral": 70,
+      "mensaje": "Cuidado: tus valores de glucosa indican que en los próximos 30 minutos podrías tener una hipoglucemia."
+    },
+    "hipo_sensible": {
+      "regla": "limite_inferior",
+      "alfa": 0.1,
+      "cuantil": "inferior_a010",
+      "umbral": 70
+    },
+    "hiper": {
+      "regla": "prediccion_puntual",
+      "umbral": 195,
+      "mensaje": "Cuidado: tus valores de glucosa indican que en los próximos 30 minutos podrías tener una hiperglucemia."
+    },
+    "hiper_temprano": {
+      "regla": "limite_superior",
+      "alfa": 0.2,
+      "cuantil": "superior_a020",
+      "umbral": 195
+    }
+  },
+  "aviso_legal": "Glucast complementa las alertas del sensor y de SmartGuard; no las reemplaza ni es un dispositivo médico certificado."
+}
