@@ -118,35 +118,29 @@ def evaluar(df_sgv, df_trt, ahora=None):
 
 # ---------------------------------------------------------------- Nightscout
 def diagnostico_nightscout():
-    """Dice si Nightscout acepta el token y cuándo fue la última lectura (sin exponer datos sensibles)."""
+    """Cuándo fue la última lectura que Nightscout tiene guardada (sin exponer datos sensibles)."""
     try:
-        r = requests.get(f'{NS_URL}/api/v1/entries/sgv.json', params={'token': NS_TOKEN, 'count': 1}, timeout=20)
-        d = {'http_nightscout': r.status_code}
-        if r.ok:
-            j = r.json()
-            if isinstance(j, list) and j and j[0].get('date'):
-                ult = datetime.fromtimestamp(j[0]['date'] / 1000, tz=timezone.utc).astimezone(ZoneInfo(CFG['zona_horaria']))
-                d['ultima_lectura'] = ult.strftime('%Y-%m-%d %H:%M')
-                d['minutos_desde_ultima'] = round((datetime.now(timezone.utc) - ult).total_seconds() / 60)
-            else:
-                d['ultima_lectura'] = None
-                d['respuesta'] = type(j).__name__ + (f' con {len(j)} elementos' if isinstance(j, (list, dict)) else '')
-                r2 = requests.get(f'{NS_URL}/api/v1/entries.json', params={'token': NS_TOKEN, 'count': 1}, timeout=20)
-                j2 = r2.json() if r2.ok else None
-                d['entries_sin_filtro'] = {'http': r2.status_code,
-                                           'tipo': (j2[0].get('type') if isinstance(j2, list) and j2 else None),
-                                           'fecha': (j2[0].get('dateString') if isinstance(j2, list) and j2 else None)}
-                r3 = requests.get(f'{NS_URL}/api/v1/entries/sgv.json', params={'count': 1}, timeout=20)
-                d['sin_token_http'] = r3.status_code
+        r = requests.get(f'{NS_URL}/api/v1/entries/sgv.json',
+                         params={'token': NS_TOKEN, 'count': 1, 'find[date][$gte]': 0}, timeout=20)
+        d = {'http_nightscout': r.status_code, 'ultima_lectura': None}
+        j = r.json() if r.ok else None
+        if isinstance(j, list) and j and j[0].get('date'):
+            ult = datetime.fromtimestamp(j[0]['date'] / 1000, tz=timezone.utc).astimezone(ZoneInfo(CFG['zona_horaria']))
+            d['ultima_lectura'] = ult.strftime('%Y-%m-%d %H:%M')
+            d['horas_desde_ultima'] = round((datetime.now(timezone.utc) - ult).total_seconds() / 3600, 1)
         return d
     except Exception as ex:
         return {'error': type(ex).__name__}
 
-def leer_nightscout(horas=6):
-    desde = datetime.now(timezone.utc) - timedelta(hours=horas)
-    p = {'token': NS_TOKEN}
-    e = requests.get(f'{NS_URL}/api/v1/entries/sgv.json', params={**p, 'find[date][$gte]': int(desde.timestamp() * 1000), 'count': 1000}, timeout=20).json()
-    t = requests.get(f'{NS_URL}/api/v1/treatments.json', params={**p, 'find[created_at][$gte]': desde.strftime('%Y-%m-%dT%H:%M:%S.000Z'), 'count': 1000}, timeout=20).json()
+def leer_nightscout(hasta=None, horas=6, extra_min=0):
+    """Lecturas y tratamientos entre (hasta - horas) y (hasta + extra_min). hasta=None -> ahora."""
+    hasta = hasta or datetime.now(timezone.utc)
+    desde, fin = hasta - timedelta(hours=horas), hasta + timedelta(minutes=extra_min)
+    p = {'token': NS_TOKEN, 'count': 1000}
+    e = requests.get(f'{NS_URL}/api/v1/entries/sgv.json', params={**p, 'find[date][$gte]': int(desde.timestamp() * 1000),
+                     'find[date][$lte]': int(fin.timestamp() * 1000)}, timeout=20).json()
+    t = requests.get(f'{NS_URL}/api/v1/treatments.json', params={**p, 'find[created_at][$gte]': desde.strftime('%Y-%m-%dT%H:%M:%S.000Z'),
+                     'find[created_at][$lte]': fin.strftime('%Y-%m-%dT%H:%M:%S.000Z')}, timeout=20).json()
     df_sgv = pd.DataFrame([{'ts': x['date'], 'glucosa': x['sgv']} for x in e if x.get('sgv') and x.get('date')])
     df_sgv['ts'] = pd.to_datetime(df_sgv['ts'], unit='ms', utc=True) if len(df_sgv) else pd.Series(dtype='datetime64[ns, UTC]')
     filas = [{'ts': x['created_at'], 'bolo_u': float(x.get('insulin') or 0), 'carbs': float(x.get('carbs') or 0)} for x in t if x.get('created_at')]
@@ -163,14 +157,45 @@ def health():
 def alerta():
     if ALERTA_KEY and (request.headers.get('X-Glucast-Key') or '').strip() != ALERTA_KEY:
         return jsonify({'error': 'no autorizado'}), 401
+    simular = (request.args.get('simular') or '').strip()
     try:
+        if simular:
+            return jsonify(simular_alerta(simular))
         df_sgv, df_trt = leer_nightscout()
         if df_sgv.empty:
-            return jsonify({'estado': 'sin_datos', 'mensaje': 'Nightscout no devolvió lecturas recientes.',
+            return jsonify({'estado': 'sin_datos', 'mensaje': 'Nightscout no tiene lecturas de las últimas horas (no hay datos en vivo).',
                             'diagnostico': diagnostico_nightscout()})
         return jsonify(evaluar(df_sgv, df_trt))
+    except ValueError as ex:
+        return jsonify({'estado': 'error', 'mensaje': str(ex)}), 400
     except Exception as ex:
         return jsonify({'estado': 'error', 'mensaje': f'No se pudo calcular la alerta: {type(ex).__name__}'}), 502
+
+def simular_alerta(texto):
+    """Modo simulación: qué habría avisado Glucast en un momento pasado (hora local, AAAA-MM-DD HH:MM),
+    usando solo los datos disponibles hasta ese momento. Agrega la glucosa real 30 min después para comparar."""
+    try:
+        t_loc = pd.Timestamp(texto.replace('T', ' '))
+    except Exception:
+        raise ValueError('Formato de fecha inválido. Usá AAAA-MM-DD HH:MM (hora de Argentina).')
+    if t_loc.tzinfo is not None:
+        t_loc = t_loc.tz_convert(CFG['zona_horaria']).tz_localize(None)
+    t_utc = t_loc.tz_localize(CFG['zona_horaria']).tz_convert('UTC').to_pydatetime()
+    df_sgv, df_trt = leer_nightscout(hasta=t_utc, extra_min=40)
+    base = {'simulacion': True, 'momento_simulado': t_loc.strftime('%Y-%m-%d %H:%M')}
+    if df_sgv.empty:
+        return {**base, 'estado': 'sin_datos', 'mensaje': 'Nightscout no tiene lecturas en ese momento.'}
+    t_ts = pd.Timestamp(t_utc)
+    pasado = df_sgv[df_sgv['ts'] <= t_ts]
+    trt_pasado = df_trt[df_trt['ts'] <= t_ts] if len(df_trt) else df_trt
+    if pasado.empty:
+        return {**base, 'estado': 'sin_datos', 'mensaje': 'No hay lecturas antes de ese momento.'}
+    res = evaluar(pasado, trt_pasado, ahora=t_loc)
+    futuro = df_sgv[(df_sgv['ts'] > t_ts + pd.Timedelta(minutes=25)) & (df_sgv['ts'] <= t_ts + pd.Timedelta(minutes=35))]
+    if len(futuro):
+        k = (futuro['ts'] - (t_ts + pd.Timedelta(minutes=30))).abs().idxmin()
+        res['glucosa_real_30min'] = int(futuro.loc[k, 'glucosa'])
+    return {**base, **res}
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5002)))
