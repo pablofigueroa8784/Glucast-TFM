@@ -18,6 +18,7 @@ Variables de entorno (Railway → Variables):
 
 Glucast complementa las alertas del sensor y de SmartGuard; no las reemplaza ni es un dispositivo médico certificado.
 """
+from zoneinfo import ZoneInfo
 import os, json
 from datetime import datetime, timedelta, timezone
 import numpy as np, pandas as pd, requests
@@ -28,7 +29,7 @@ CFG = json.load(open(os.path.join(BASE, 'glucast_alarmas.json'), encoding='utf-8
 PESOS = dict(np.load(os.path.join(BASE, 'glucast_lstm_30min.npz')))
 NS_URL = os.environ.get('NIGHTSCOUT_URL', '').rstrip('/')
 NS_TOKEN = os.environ.get('NIGHTSCOUT_TOKEN', '')
-ALERTA_KEY = os.environ.get('ALERTA_KEY', '')
+ALERTA_KEY = os.environ.get('ALERTA_KEY', '').strip().strip('"').strip("'").strip()
 
 app = Flask(__name__)
 
@@ -116,6 +117,23 @@ def evaluar(df_sgv, df_trt, ahora=None):
             'modelo': CFG['version'], 'aviso': CFG['aviso_legal']}
 
 # ---------------------------------------------------------------- Nightscout
+def diagnostico_nightscout():
+    """Dice si Nightscout acepta el token y cuándo fue la última lectura (sin exponer datos sensibles)."""
+    try:
+        r = requests.get(f'{NS_URL}/api/v1/entries/sgv.json', params={'token': NS_TOKEN, 'count': 1}, timeout=20)
+        d = {'http_nightscout': r.status_code}
+        if r.ok:
+            j = r.json()
+            if isinstance(j, list) and j and j[0].get('date'):
+                ult = datetime.fromtimestamp(j[0]['date'] / 1000, tz=timezone.utc).astimezone(ZoneInfo(CFG['zona_horaria']))
+                d['ultima_lectura'] = ult.strftime('%Y-%m-%d %H:%M')
+                d['minutos_desde_ultima'] = round((datetime.now(timezone.utc) - ult).total_seconds() / 60)
+            else:
+                d['ultima_lectura'] = None
+        return d
+    except Exception as ex:
+        return {'error': type(ex).__name__}
+
 def leer_nightscout(horas=6):
     desde = datetime.now(timezone.utc) - timedelta(hours=horas)
     p = {'token': NS_TOKEN}
@@ -130,16 +148,18 @@ def leer_nightscout(horas=6):
 
 @app.route('/health')
 def health():
-    return jsonify({'service': 'Glucast Alert Server', 'status': 'ok', 'modelo': CFG['version'], 'nightscout_configurado': bool(NS_URL and NS_TOKEN)})
+    return jsonify({'service': 'Glucast Alert Server', 'status': 'ok', 'modelo': CFG['version'], 'nightscout_configurado': bool(NS_URL and NS_TOKEN),
+                    'clave_configurada': bool(ALERTA_KEY), 'largo_clave': len(ALERTA_KEY)})
 
 @app.route('/alerta')
 def alerta():
-    if ALERTA_KEY and request.headers.get('X-Glucast-Key') != ALERTA_KEY:
+    if ALERTA_KEY and (request.headers.get('X-Glucast-Key') or '').strip() != ALERTA_KEY:
         return jsonify({'error': 'no autorizado'}), 401
     try:
         df_sgv, df_trt = leer_nightscout()
         if df_sgv.empty:
-            return jsonify({'estado': 'sin_datos', 'mensaje': 'Nightscout no devolvió lecturas recientes.'})
+            return jsonify({'estado': 'sin_datos', 'mensaje': 'Nightscout no devolvió lecturas recientes.',
+                            'diagnostico': diagnostico_nightscout()})
         return jsonify(evaluar(df_sgv, df_trt))
     except Exception as ex:
         return jsonify({'estado': 'error', 'mensaje': f'No se pudo calcular la alerta: {type(ex).__name__}'}), 502
