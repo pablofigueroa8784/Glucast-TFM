@@ -27,7 +27,7 @@ from flask import Flask, request, jsonify
 BASE = os.path.dirname(os.path.abspath(__file__))
 CFG = json.load(open(os.path.join(BASE, 'glucast_alarmas.json'), encoding='utf-8'))
 PESOS = dict(np.load(os.path.join(BASE, 'glucast_lstm_30min.npz')))
-NS_URL = os.environ.get('NIGHTSCOUT_URL', '').rstrip('/')
+NS_URL = os.environ.get('NIGHTSCOUT_URL', '').strip().rstrip('/')
 NS_TOKEN = os.environ.get('NIGHTSCOUT_TOKEN', '')
 ALERTA_KEY = os.environ.get('ALERTA_KEY', '').strip().strip('"').strip("'").strip()
 
@@ -130,6 +130,14 @@ def diagnostico_nightscout():
                 d['minutos_desde_ultima'] = round((datetime.now(timezone.utc) - ult).total_seconds() / 60)
             else:
                 d['ultima_lectura'] = None
+                d['respuesta'] = type(j).__name__ + (f' con {len(j)} elementos' if isinstance(j, (list, dict)) else '')
+                r2 = requests.get(f'{NS_URL}/api/v1/entries.json', params={'token': NS_TOKEN, 'count': 1}, timeout=20)
+                j2 = r2.json() if r2.ok else None
+                d['entries_sin_filtro'] = {'http': r2.status_code,
+                                           'tipo': (j2[0].get('type') if isinstance(j2, list) and j2 else None),
+                                           'fecha': (j2[0].get('dateString') if isinstance(j2, list) and j2 else None)}
+                r3 = requests.get(f'{NS_URL}/api/v1/entries/sgv.json', params={'count': 1}, timeout=20)
+                d['sin_token_http'] = r3.status_code
         return d
     except Exception as ex:
         return {'error': type(ex).__name__}
